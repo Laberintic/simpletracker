@@ -1,2 +1,3 @@
 # one line per event: date [count] [tracker name]
+2026-11-18 1 x
 2026-11-19 1 x
