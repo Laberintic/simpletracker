@@ -74,6 +74,18 @@ button.on{background:var(--accent);border-color:var(--accent);color:#fff}
 .empty p{max-width:520px;margin:6px auto;color:var(--muted)}
 code{background:var(--empty);padding:1px 5px;border-radius:4px;font-size:.9em}
 .drop{outline:2px dashed var(--accent);outline-offset:-8px}
+button:disabled{opacity:.4;cursor:default}
+.status{font-size:.8rem;color:var(--muted)}
+.status.err{color:#d1453b;cursor:pointer;text-decoration:underline}
+.ctl{margin-left:auto;display:flex;gap:6px;align-items:center}
+.ctl button{min-width:44px;font-weight:700}
+dialog{background:var(--card);color:var(--fg);border:1px solid var(--border);border-radius:12px;max-width:420px;width:calc(100% - 32px);padding:18px}
+dialog::backdrop{background:rgba(0,0,0,.45)}
+dialog h2{margin:0 0 4px;font-size:1.1rem}
+dialog label{display:block;margin-top:10px;font-size:.85rem;color:var(--muted)}
+dialog input{display:block;width:100%;margin-top:4px;font:inherit;color:var(--fg);background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:7px 10px}
+dialog .row{display:flex;gap:8px;margin-top:16px;justify-content:flex-end}
+dialog .small{font-size:.8rem;margin:10px 0 0}
 @media(max-width:560px){.day{min-height:56px;padding:4px}.pip{width:6px;height:6px}}
 </style>
 </head>
@@ -84,6 +96,8 @@ code{background:var(--empty);padding:1px 5px;border-radius:4px;font-size:.9em}
     <div class="tools">
       <select id="tracker" aria-label="Tracker" hidden></select>
       <input type="color" id="accent" title="Accent colour" aria-label="Accent colour">
+      <span id="status" class="status" role="status"></span>
+      <button id="settings" title="Save changes to GitHub">GitHub</button>
       <button id="reload" title="Reload data file">Reload</button>
       <button id="open" title="Open a data file">Open file</button>
       <button id="theme" aria-label="Toggle dark mode">Dark</button>
@@ -92,6 +106,23 @@ code{background:var(--empty);padding:1px 5px;border-radius:4px;font-size:.9em}
   </header>
   <div id="content"></div>
 </main>
+
+<dialog id="dlg">
+  <form id="cfg">
+    <h2>Save to GitHub</h2>
+    <p class="muted small">Changes are committed straight to the data file in your repo.</p>
+    <label>Repository <input id="c-repo" placeholder="you/your-repo" autocomplete="off" required></label>
+    <label>Branch <input id="c-branch" placeholder="main" autocomplete="off"></label>
+    <label>Data file <input id="c-path" placeholder="data.txt" autocomplete="off" required></label>
+    <label>Access token <input id="c-token" type="password" autocomplete="off" required></label>
+    <p class="muted small">Use a fine-grained token limited to this one repo with “Contents: read and write”. It is stored in this browser only.</p>
+    <div class="row">
+      <button type="button" id="c-forget">Forget token</button>
+      <button type="button" id="c-cancel">Cancel</button>
+      <button class="on">Save</button>
+    </div>
+  </form>
+</dialog>
 
 <script>
 /* ---- Config ---- */
@@ -113,7 +144,7 @@ const now = new Date();
 const TODAY = key(now.getFullYear(), now.getMonth(), now.getDate());
 const ALL = '__all__';
 
-const S = { data: {}, tracker: ALL, view: 'year', year: now.getFullYear(), month: now.getMonth(), sel: TODAY, loaded: false, title: 'Keep track' };
+const S = { data: {}, tracker: ALL, view: 'year', year: now.getFullYear(), month: now.getMonth(), sel: TODAY, loaded: false, title: 'Keep track', pending: [], saving: false, source: null };
 
 /* ---- Parsing ---- */
 function normDate(s) {
@@ -150,9 +181,7 @@ function parse(text) {
   }
   return { data, title };
 }
-function setData(text) {
-  const r = parse(text); S.data = r.data; S.loaded = true;
-  S.title = r.title || 'Keep track'; document.title = S.title; $('#title').textContent = S.title;
+function syncSelect() {
   const names = Object.keys(S.data);
   if (S.tracker !== ALL && !names.includes(S.tracker)) S.tracker = ALL;
   if (names.length === 1) S.tracker = names[0];
@@ -161,7 +190,101 @@ function setData(text) {
   sel.innerHTML = (names.length > 1 ? `<option value="${ALL}">All</option>` : '') +
     names.map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join('');
   sel.value = S.tracker;
+}
+function applyData(data, title) {
+  S.data = data; S.loaded = true;
+  S.title = title || 'Keep track'; document.title = S.title; $('#title').textContent = S.title;
   render();
+}
+function setData(text, src) {
+  if (src) S.source = src;
+  const r = parse(text); applyData(r.data, r.title);
+}
+
+/* ---- Writing back (GitHub) ---- */
+function leadComments(text) {
+  if (/^\s*[\[{]/.test(text)) return [];
+  const out = [];
+  for (const l of text.split(/\r?\n/)) { if (/^\s*#/.test(l)) out.push(l); else if (l.trim() === '') continue; else break; }
+  return out;
+}
+function serialize(data, title, header, asJson) {
+  const rows = [];
+  for (const [n, m] of Object.entries(data)) for (const [d, c] of Object.entries(m)) if (c > 0) rows.push([d, n, c]);
+  rows.sort((a, b) => a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : a[1] < b[1] ? -1 : 1);
+  if (asJson) {
+    const o = {}; if (title && title !== 'Keep track') o.title = title;
+    const names = [...new Set(rows.map(r => r[1]))].sort();
+    const mapOf = n => Object.fromEntries(rows.filter(r => r[1] === n).map(r => [r[0], r[2]]));
+    if (names.length === 1 && names[0] === 'Tracker') Object.assign(o, mapOf('Tracker'));
+    else names.forEach(n => o[n] = mapOf(n));
+    return JSON.stringify(o, null, 2) + '\n';
+  }
+  return [...header, ...rows.map(([d, n, c]) => `${d} ${c}${n === 'Tracker' ? '' : ' ' + n}`)].join('\n') + '\n';
+}
+const GH_KEY = 'kt-gh';
+function ghCfg() { try { return JSON.parse(read(GH_KEY) || 'null'); } catch { return null; } }
+const ghOk = c => !!(c && c.repo && c.token && c.path);
+const b64e = s => { let t = ''; new TextEncoder().encode(s).forEach(x => t += String.fromCharCode(x)); return btoa(t); };
+const b64d = s => new TextDecoder().decode(Uint8Array.from(atob(s.replace(/\s/g, '')), c => c.charCodeAt(0)));
+async function gh(c, method, body) {
+  const path = c.path.split('/').map(encodeURIComponent).join('/');
+  const url = `https://api.github.com/repos/${c.repo}/contents/${path}` + (method === 'GET' ? `?ref=${encodeURIComponent(c.branch)}` : '');
+  const r = await fetch(url, { method, cache: 'no-store', body: body && JSON.stringify(body),
+    headers: { Accept: 'application/vnd.github+json', Authorization: 'Bearer ' + c.token } });
+  if (r.status === 404 && method === 'GET') return null;          // file doesn't exist yet
+  if (!r.ok) {
+    const e = new Error(r.status === 401 ? 'token rejected' : r.status === 403 ? 'token has no write access'
+      : r.status === 404 ? 'repo or branch not found' : (r.status === 409 || r.status === 422) ? 'conflict' : 'GitHub error ' + r.status);
+    throw e;
+  }
+  return r.json();
+}
+async function commit(batch) {
+  const c = ghCfg(), asJson = /\.json$/i.test(c.path);
+  for (let i = 0; i < 3; i++) {
+    const f = await gh(c, 'GET');                                  // always start from the latest remote copy
+    const text = f ? b64d(f.content) : '';
+    const r = text.trim() ? parse(text) : { data: {}, title: null };
+    for (const { t, d, n } of batch) {
+      const m = (r.data[t] ||= {}); m[d] = Math.max(0, (m[d] || 0) + n); if (!m[d]) delete m[d];
+    }
+    const msg = batch.length === 1 ? `${batch[0].t} ${batch[0].n > 0 ? '+' : '−'}1 on ${batch[0].d}` : `Update tracker (${batch.length} changes)`;
+    try {
+      await gh(c, 'PUT', { message: msg, branch: c.branch, content: b64e(serialize(r.data, r.title, leadComments(text), asJson)), ...(f ? { sha: f.sha } : {}) });
+      return r;
+    } catch (e) { if (e.message !== 'conflict' || i === 2) throw e; }
+  }
+}
+function setStatus(msg, err) {
+  const el = $('#status'); el.textContent = msg; el.className = 'status' + (err ? ' err' : '');
+  if (msg === 'Saved ✓') setTimeout(() => { if (el.textContent === 'Saved ✓') el.textContent = ''; }, 3000);
+}
+async function flush() {
+  if (S.saving) return;
+  S.saving = true; setStatus('Saving…');
+  try {
+    while (S.pending.length) {
+      const batch = S.pending.splice(0);
+      try { const r = await commit(batch); if (!S.pending.length) applyData(r.data, r.title); }
+      catch (e) { S.pending.unshift(...batch); setStatus('Not saved: ' + e.message + ' (click to retry)', true); return; }
+    }
+    setStatus('Saved ✓');
+  } finally { S.saving = false; }
+}
+function editTracker() {
+  const names = Object.keys(S.data);
+  if (S.tracker !== ALL) return S.tracker;
+  return names.length < 2 ? (names[0] || 'Tracker') : null;
+}
+function change(n) {
+  const t = editTracker(); if (!t) return;
+  if (!ghOk(ghCfg())) { openSettings(); return; }
+  const m = (S.data[t] ||= {}), old = m[S.sel] || 0, v = Math.max(0, old + n);
+  if (v === old) return;
+  v ? m[S.sel] = v : delete m[S.sel];
+  S.pending.push({ t, d: S.sel, n: v - old });
+  render(); flush();
 }
 
 /* ---- Data access ---- */
@@ -186,7 +309,9 @@ function streaks(map) {
 
 /* ---- Rendering ---- */
 function render() {
+  syncSelect();
   const el = $('#content');
+  const keepScroll = document.querySelector('.scroll')?.scrollLeft || 0;
   if (!S.loaded) { el.innerHTML = emptyState(); return; }
   const map = getMap(), y = S.year, m = S.month;
   const inPeriod = k => S.view === 'year' ? k.startsWith(y + '-') : k.startsWith(`${y}-${pad(m + 1)}-`);
@@ -213,6 +338,7 @@ function render() {
   if (S.view === 'year') html += `<div class="panel">${monthBars(map, y)}</div>`;
   html += `<div class="panel detail" id="detail">${detail(map)}</div>`;
   el.innerHTML = html;
+  const sc = document.querySelector('.scroll'); if (sc) sc.scrollLeft = keepScroll;
 }
 
 function yearView(map, y) {
@@ -262,9 +388,13 @@ function monthView(map, y, m) {
 }
 
 function detail(map) {
-  const c = map[S.sel] || 0;
+  const c = map[S.sel] || 0, t = editTracker();
+  let ctl;
+  if (!ghOk(ghCfg())) ctl = `<button data-act="settings">Set up saving</button>`;
+  else if (!t) ctl = `<span class="muted">Pick a tracker to edit</span>`;
+  else ctl = `<button data-act="dec" ${c ? '' : 'disabled'} aria-label="Remove one">−1</button><button data-act="inc" class="on" aria-label="Add one">+1</button>`;
   return `<div><b>${fmtDate(S.sel)}</b><div class="muted">${c ? c + (c === 1 ? ' time' : ' times') : 'Nothing logged'}</div></div>
-    <div class="pips">${pips(c)}</div>`;
+    <div class="pips">${pips(c)}</div><div class="ctl">${ctl}</div>`;
 }
 
 function emptyState() {
@@ -276,7 +406,12 @@ function emptyState() {
 
 /* ---- Events ---- */
 document.addEventListener('click', e => {
-  const t = e.target.closest('[data-nav],[data-view],[data-d],[data-month]'); if (!t) return;
+  const t = e.target.closest('[data-nav],[data-view],[data-d],[data-month],[data-act]'); if (!t) return;
+  if (t.dataset.act) {
+    const a = t.dataset.act;
+    if (a === 'inc') change(1); else if (a === 'dec') change(-1); else openSettings();
+    return;
+  }
   if (t.dataset.view) { S.view = t.dataset.view; }
   else if (t.dataset.nav) {
     const n = t.dataset.nav;
@@ -293,7 +428,9 @@ document.addEventListener('click', e => {
   render();
 });
 $('#tracker').onchange = e => { S.tracker = e.target.value; render(); };
-$('#reload').onclick = () => load();
+$('#reload').onclick = () => S.pending.length ? flush() : load();
+$('#status').onclick = () => { if (S.pending.length) flush(); };
+addEventListener('beforeunload', e => { if (S.pending.length || S.saving) { e.preventDefault(); e.returnValue = ''; } });
 $('#open').onclick = () => $('#file').click();
 $('#file').onchange = async e => { const f = e.target.files[0]; if (f) setData(await f.text()); e.target.value = ''; };
 addEventListener('dragover', e => { e.preventDefault(); document.body.classList.add('drop'); });
@@ -312,11 +449,47 @@ setAccent(read('kt-accent') || DEFAULT_ACCENT);
 $('#accent').oninput = e => setAccent(e.target.value);
 
 /* ---- Load ---- */
+/* ---- GitHub settings dialog ---- */
+const dlg = $('#dlg');
+function guess() {                       // pre-fill repo when served from <user>.github.io/<repo>/
+  const h = location.hostname; if (!h.endsWith('.github.io')) return {};
+  const o = h.split('.')[0], seg = location.pathname.split('/')[1];
+  return { repo: `${o}/${seg && !/\.html?$/.test(seg) ? seg : o + '.github.io'}` };
+}
+function openSettings() {
+  const c = ghCfg() || {}, g = guess();
+  $('#c-repo').value = c.repo || g.repo || '';
+  $('#c-branch').value = c.branch || 'main';
+  $('#c-path').value = c.path || S.source || 'data.txt';
+  $('#c-token').value = c.token || '';
+  dlg.showModal();
+}
+$('#settings').onclick = openSettings;
+$('#c-cancel').onclick = () => dlg.close();
+$('#c-forget').onclick = () => { store(GH_KEY, ''); dlg.close(); setStatus('Token removed'); render(); };
+$('#cfg').onsubmit = e => {
+  e.preventDefault();
+  const c = { repo: $('#c-repo').value.trim().replace(/^https?:\/\/github\.com\//, '').replace(/\/$/, ''),
+    branch: $('#c-branch').value.trim() || 'main', path: $('#c-path').value.trim().replace(/^\//, ''),
+    token: $('#c-token').value.trim() };
+  if (!ghOk(c)) return;
+  store(GH_KEY, JSON.stringify(c)); dlg.close(); load();
+};
+
+/* ---- Load ---- */
 async function load() {
+  const c = ghCfg();
+  if (ghOk(c)) {                         // read through the API: always the latest commit, no Pages delay
+    try {
+      const f = await gh(c, 'GET');
+      if (f) { setData(b64d(f.content), c.path); return; }
+      setData('', c.path); setStatus('File will be created on first save'); return;
+    } catch (e) { setStatus('GitHub: ' + e.message, true); }
+  }
   for (const f of FILES) {
     try {
       const r = await fetch(f + '?t=' + Date.now(), {cache: 'no-store'});
-      if (r.ok) { setData(await r.text()); return; }
+      if (r.ok) { setData(await r.text(), f); return; }
     } catch {}
   }
   if (!S.loaded) render();
